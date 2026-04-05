@@ -1,0 +1,173 @@
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Conv2D, DepthwiseConv2D, BatchNormalization,
+    ReLU, GlobalAveragePooling2D, Dense, Dropout,
+    Reshape, Multiply, Add
+)
+from tensorflow.keras.optimizers.legacy import Adam
+import tensorflow.keras.backend as K
+import math
+
+# -----------------------------
+# Hyperparameters
+# -----------------------------
+EPOCHS = args.epochs or 40
+LEARNING_RATE = args.learning_rate or 0.001
+ENSURE_DETERMINISM = args.ensure_determinism
+BATCH_SIZE = args.batch_size or 64
+
+if not ENSURE_DETERMINISM:
+    train_dataset = train_dataset.shuffle(buffer_size=BATCH_SIZE * 8)
+train_dataset = train_dataset.batch(BATCH_SIZE, drop_remainder=False)
+validation_dataset = validation_dataset.batch(BATCH_SIZE, drop_remainder=False)
+
+# -----------------------------
+# Label smoothing loss
+# -----------------------------
+def label_smoothed_loss(y_true, y_pred, smoothing=0.1):
+    n_classes = tf.cast(tf.shape(y_pred)[-1], tf.float32)
+    y_true_smooth = y_true * (1.0 - smoothing) + (smoothing / n_classes)
+    return tf.keras.losses.categorical_crossentropy(y_true_smooth, y_pred)
+
+# -----------------------------
+# Cosine decay schedule (callback-based, Edge Impulse compatible)
+# -----------------------------
+def cosine_decay_schedule(epoch):
+    progress = epoch / max(EPOCHS - 1, 1)
+    cosine = 0.5 * (1 + math.cos(math.pi * progress))
+    return float(LEARNING_RATE * cosine + 1e-7)
+
+# -----------------------------
+# Depthwise Separable Block with optional residual
+# -----------------------------
+def ds_block(x, filters, stride=1):
+    residual = x
+    out = DepthwiseConv2D(3, strides=stride, padding='same', use_bias=False)(x)
+    out = BatchNormalization()(out)
+    out = ReLU()(out)
+    out = Conv2D(filters, 1, padding='same', use_bias=False)(out)
+    out = BatchNormalization()(out)
+    out = ReLU()(out)
+    if stride == 1 and K.int_shape(residual)[-1] == filters:
+        out = Add()([out, residual])
+    return out
+
+# -----------------------------
+# Squeeze-and-Excitation block
+# -----------------------------
+def se_block(x, ratio=8):
+    channels = K.int_shape(x)[-1]
+    se = GlobalAveragePooling2D()(x)
+    se = Dense(max(channels // ratio, 4), activation='relu')(se)
+    se = Dense(channels, activation='sigmoid')(se)
+    se = Reshape((1, 1, channels))(se)
+    return Multiply()([x, se])
+
+# -----------------------------
+# AgriFreshNet-Lite v2 (160x160)
+# -----------------------------
+inputs = Input(shape=(160, 160, 3))
+
+# Stem
+x = Conv2D(16, 3, strides=2, padding='same', use_bias=False)(inputs)  # 80x80
+x = BatchNormalization()(x)
+x = ReLU()(x)
+
+# -------- Texture Branch --------
+t = ds_block(x, 32)               # 80x80
+t = se_block(t)
+t = ds_block(t, 64, stride=2)     # 40x40
+t = se_block(t)
+t = ds_block(t, 128, stride=2)    # 20x20
+
+# -------- Color Branch (channel attention gate) --------
+c = GlobalAveragePooling2D()(x)
+c = Dense(32, activation='relu')(c)
+c = Dense(128, activation='sigmoid')(c)
+c = Reshape((1, 1, 128))(c)
+
+# -------- Fusion --------
+fused = Multiply()([t, c])
+
+# -------- Head --------
+fused = ds_block(fused, 128)
+fused = se_block(fused)
+fused = GlobalAveragePooling2D()(fused)
+fused = Dropout(0.5)(fused)
+fused = Dense(64, activation='relu')(fused)
+fused = Dropout(0.3)(fused)
+outputs = Dense(classes, activation='softmax', name='y_pred')(fused)
+
+model = Model(inputs, outputs)
+
+# -----------------------------
+# Optimizer (plain scalar LR — Edge Impulse logger compatible)
+# -----------------------------
+opt = Adam(learning_rate=LEARNING_RATE)
+
+# -----------------------------
+# Callbacks
+# -----------------------------
+callbacks.append(
+    BatchLoggerCallback(
+        BATCH_SIZE,
+        train_sample_count,
+        epochs=EPOCHS,
+        ensure_determinism=ENSURE_DETERMINISM
+    )
+)
+
+callbacks.append(
+    tf.keras.callbacks.LearningRateScheduler(cosine_decay_schedule, verbose=0)
+)
+
+callbacks.append(
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=4,
+        min_lr=1e-7,
+        verbose=1
+    )
+)
+
+callbacks.append(
+    tf.keras.callbacks.ModelCheckpoint(
+        '/tmp/best_model.h5',
+        monitor='val_loss',
+        save_best_only=True,
+        verbose=1
+    )
+)
+
+# -----------------------------
+# Compile and train
+# -----------------------------
+model.compile(
+    loss=label_smoothed_loss,
+    optimizer=opt,
+    metrics=['accuracy']
+)
+
+model.fit(
+    train_dataset,
+    epochs=EPOCHS,
+    validation_data=validation_dataset,
+    verbose=2,
+    callbacks=callbacks,
+    class_weight=ei_tensorflow.training.get_class_weights(Y_train)
+)
+
+# -----------------------------
+# Load best checkpoint for export
+# -----------------------------
+model = tf.keras.models.load_model(
+    '/tmp/best_model.h5',
+    custom_objects={'label_smoothed_loss': label_smoothed_loss}
+)
+
+# -----------------------------
+# Quantization flag
+# -----------------------------
+disable_per_channel_quantization = False
